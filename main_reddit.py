@@ -256,9 +256,14 @@ def generate_story_continuation(plan: dict, part_num: int, previous_phrases: lis
     is_final = part_num == total_parts
     print(f"📝 Generando Parte {part_num}/{total_parts}...")
 
-    # Le pasamos las últimas frases ya narradas como ancla de continuidad,
-    # sin mandar la historia entera (innecesario y más caro en tokens).
-    recap = " ".join(previous_phrases[-18:])
+    # Las últimas 2 frases de la parte anterior son el gancho tipo "Parte 2
+    # en mi perfil" (no forman parte real de la historia), así que para
+    # anclar la continuidad usamos el contenido narrativo de ANTES de ese
+    # gancho — si no, Gemini intentaría continuar literalmente desde la
+    # frase de "mira la siguiente parte", que no tiene sentido narrativo.
+    story_phrases = previous_phrases[:-2] if len(previous_phrases) > 2 else previous_phrases
+    recap = " ".join(story_phrases[-18:])
+    last_lines = " / ".join(story_phrases[-2:])
 
     if is_final:
         ending_rule = (
@@ -281,9 +286,14 @@ primera persona ("yo"). Esta es la Parte {part_num} de {total_parts}.
 Resumen completo de la historia (guía interna tuya, el espectador no lo ve):
 "{plan['outline']}"
 
-Esto es literalmente lo último que ya se narró en la parte anterior (el
-espectador ya lo escuchó — NO lo repitas, continúa justo a partir de ahí):
+Esto es literalmente lo último que ya se narró en la parte anterior, en orden
+(el espectador ya lo escuchó — NO lo repitas, tu primera frase nueva debe ser
+la continuación EXACTA de la última de estas):
 "{recap}"
+
+Las dos frases FINALES exactas de la parte anterior, para que las tengas
+clarísimas como punto de arranque, fueron:
+"{last_lines}"
 
 Devuelve SOLO JSON válido, sin markdown ni explicaciones:
 
@@ -294,9 +304,17 @@ Devuelve SOLO JSON válido, sin markdown ni explicaciones:
   ]
 }}
 
-Reglas:
-- Empieza EN SECO, directamente donde lo dejaste — sin ningún "recordemos"
-  ni resumen de lo anterior, como si no hubiera corte
+Reglas MUY IMPORTANTES sobre la continuidad:
+- Tu primera frase nueva es literalmente lo que pasa justo DESPUÉS de la
+  última frase de arriba, en el mismo instante, la misma escena, el mismo
+  lugar — como si no hubiera existido ningún corte entre vídeos
+- PROHIBIDO: saltos de tiempo ("más tarde", "al día siguiente", "esa
+  noche..."), cambios de escena, resúmenes, "recordemos", reintroducir a
+  los personajes o el contexto, o retomar la historia desde un punto
+  distinto al exacto donde terminó la parte anterior
+- Sigue tal cual la acción, la conversación o el momento exacto que estaba
+  ocurriendo — es literalmente la frase siguiente de la misma historia,
+  no un nuevo capítulo
 - Entre {PHRASES_PER_PART_MIN} y {PHRASES_PER_PART_MAX} frases
 - Cada frase: máximo 6 palabras, impactante y clara
 {ending_rule}
