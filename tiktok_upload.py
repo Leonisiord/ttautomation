@@ -16,6 +16,7 @@ Dos modos disponibles:
 
 import os
 import json
+import math
 import requests
 from dotenv import load_dotenv
 
@@ -23,6 +24,43 @@ load_dotenv()
 CLIENT_KEY    = os.getenv("TIKTOK_CLIENT_KEY")
 CLIENT_SECRET = os.getenv("TIKTOK_CLIENT_SECRET")
 TOKENS_FILE   = "tiktok_tokens.json"
+
+# Límites de TikTok para FILE_UPLOAD: cada trozo debe medir entre 5MB y 64MB
+# (el último trozo puede llegar hasta 128MB). Un vídeo de menos de 5MB se
+# manda entero como un único trozo; si pesa más de 64MB, hay que trocearlo.
+_MIN_CHUNK = 5 * 1024 * 1024
+_MAX_CHUNK = 60 * 1024 * 1024  # algo por debajo del límite de 64MB, con margen
+
+
+def _compute_chunk_plan(video_size: int) -> tuple:
+    """Devuelve (chunk_size, total_chunk_count) válidos para TikTok."""
+    if video_size <= _MIN_CHUNK:
+        return video_size, 1
+    total_chunk_count = math.ceil(video_size / _MAX_CHUNK)
+    chunk_size = math.ceil(video_size / total_chunk_count)
+    return chunk_size, total_chunk_count
+
+
+def _put_video_chunks(upload_url: str, video_path: str, video_size: int, chunk_size: int, total_chunk_count: int):
+    """Sube el vídeo en uno o varios trozos, con el Content-Range correcto en cada uno."""
+    with open(video_path, "rb") as f:
+        for i in range(total_chunk_count):
+            start = i * chunk_size
+            end = min(start + chunk_size, video_size) - 1
+            f.seek(start)
+            chunk_bytes = f.read(end - start + 1)
+
+            put_response = requests.put(
+                upload_url,
+                headers={
+                    "Content-Type": "video/mp4",
+                    "Content-Range": f"bytes {start}-{end}/{video_size}",
+                },
+                data=chunk_bytes,
+            )
+            if not put_response.ok:
+                print(f"  ❌ TikTok respondió {put_response.status_code} al subir el trozo {i+1}/{total_chunk_count}: {put_response.text}")
+            put_response.raise_for_status()
 
 
 def _load_tokens() -> dict:
@@ -56,7 +94,7 @@ def _refresh_access_token(tokens: dict) -> dict:
     return new_tokens
 
 
-def _init_upload(access_token: str, video_size: int):
+def _init_upload(access_token: str, video_size: int, chunk_size: int, total_chunk_count: int):
     return requests.post(
         "https://open.tiktokapis.com/v2/post/publish/inbox/video/init/",
         headers={
@@ -67,8 +105,8 @@ def _init_upload(access_token: str, video_size: int):
             "source_info": {
                 "source": "FILE_UPLOAD",
                 "video_size": video_size,
-                "chunk_size": video_size,
-                "total_chunk_count": 1,
+                "chunk_size": chunk_size,
+                "total_chunk_count": total_chunk_count,
             }
         },
     )
@@ -85,14 +123,16 @@ def upload_video_as_draft(video_path: str) -> str:
     tokens = _load_tokens()
     access_token = tokens["access_token"]
     video_size = os.path.getsize(video_path)
+    chunk_size, total_chunk_count = _compute_chunk_plan(video_size)
+    print(f"  📦 {video_size / (1024*1024):.1f}MB en {total_chunk_count} trozo(s)")
 
-    init_response = _init_upload(access_token, video_size)
+    init_response = _init_upload(access_token, video_size, chunk_size, total_chunk_count)
 
     if init_response.status_code == 401:
         print("  🔄 Token caducado, renovando...")
         tokens = _refresh_access_token(tokens)
         access_token = tokens["access_token"]
-        init_response = _init_upload(access_token, video_size)
+        init_response = _init_upload(access_token, video_size, chunk_size, total_chunk_count)
 
     if not init_response.ok:
         print(f"  ❌ TikTok respondió {init_response.status_code}: {init_response.text}")
@@ -105,18 +145,7 @@ def upload_video_as_draft(video_path: str) -> str:
     upload_url = init_data["data"]["upload_url"]
     publish_id = init_data["data"]["publish_id"]
 
-    with open(video_path, "rb") as f:
-        video_bytes = f.read()
-
-    put_response = requests.put(
-        upload_url,
-        headers={
-            "Content-Type": "video/mp4",
-            "Content-Range": f"bytes 0-{video_size - 1}/{video_size}",
-        },
-        data=video_bytes,
-    )
-    put_response.raise_for_status()
+    _put_video_chunks(upload_url, video_path, video_size, chunk_size, total_chunk_count)
 
     print(f"✅ Subido como borrador (publish_id: {publish_id})")
     print("   📱 Abre TikTok en el móvil para revisarlo y publicarlo.")
@@ -133,7 +162,7 @@ def _get_creator_info(access_token: str):
     )
 
 
-def _init_direct_post(access_token: str, video_size: int, title: str, privacy_level: str):
+def _init_direct_post(access_token: str, video_size: int, chunk_size: int, total_chunk_count: int, title: str, privacy_level: str):
     return requests.post(
         "https://open.tiktokapis.com/v2/post/publish/video/init/",
         headers={
@@ -151,8 +180,8 @@ def _init_direct_post(access_token: str, video_size: int, title: str, privacy_le
             "source_info": {
                 "source": "FILE_UPLOAD",
                 "video_size": video_size,
-                "chunk_size": video_size,
-                "total_chunk_count": 1,
+                "chunk_size": chunk_size,
+                "total_chunk_count": total_chunk_count,
             },
         },
     )
@@ -186,14 +215,19 @@ def upload_video_direct_post(video_path: str, title: str, privacy_level: str = "
         privacy_level = available[0]
 
     video_size = os.path.getsize(video_path)
-    init_response = _init_direct_post(access_token, video_size, title, privacy_level)
+    chunk_size, total_chunk_count = _compute_chunk_plan(video_size)
+    print(f"  📦 {video_size / (1024*1024):.1f}MB en {total_chunk_count} trozo(s)")
+
+    init_response = _init_direct_post(access_token, video_size, chunk_size, total_chunk_count, title, privacy_level)
 
     if init_response.status_code == 401:
         print("  🔄 Token caducado, renovando...")
         tokens = _refresh_access_token(tokens)
         access_token = tokens["access_token"]
-        init_response = _init_direct_post(access_token, video_size, title, privacy_level)
+        init_response = _init_direct_post(access_token, video_size, chunk_size, total_chunk_count, title, privacy_level)
 
+    if not init_response.ok:
+        print(f"  ❌ TikTok respondió {init_response.status_code}: {init_response.text}")
     init_response.raise_for_status()
     init_data = init_response.json()
 
@@ -203,18 +237,7 @@ def upload_video_direct_post(video_path: str, title: str, privacy_level: str = "
     upload_url = init_data["data"]["upload_url"]
     publish_id = init_data["data"]["publish_id"]
 
-    with open(video_path, "rb") as f:
-        video_bytes = f.read()
-
-    put_response = requests.put(
-        upload_url,
-        headers={
-            "Content-Type": "video/mp4",
-            "Content-Range": f"bytes 0-{video_size - 1}/{video_size}",
-        },
-        data=video_bytes,
-    )
-    put_response.raise_for_status()
+    _put_video_chunks(upload_url, video_path, video_size, chunk_size, total_chunk_count)
 
     print(f"✅ Publicado en modo {privacy_level} (publish_id: {publish_id})")
     print("   📱 Abre TikTok en el móvil para cambiarlo a público.")
