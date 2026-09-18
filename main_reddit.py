@@ -157,28 +157,48 @@ Devuelve SOLO JSON, sin markdown:
     return topics
 
 
-# ── PASO 1: Generar historia con Gemini ───────────────────────────────────────
-def generate_story(topic: str) -> dict:
-    print(f"📝 Generando historia sobre: {topic}")
+# ── PASO 1: Generar historia con Gemini (en 1, 2 o 3 partes) ─────────────────
+# Historias muy largas en una sola llamada a Gemini tendían a bajar de calidad
+# (sobre todo con el modelo de respaldo, más flojo) y además el vídeo final
+# pesaba demasiado para el límite de subida de TikTok. En vez de eso: le
+# pedimos a Gemini que decida si la historia da para 2 o 3 "capítulos" tipo
+# serie de TikTok — cada parte se genera con su propio prompt (más corto y
+# fácil de acertar para cualquier modelo), se convierte en su propio vídeo, y
+# termina con un gancho tipo "Parte 2 en mi perfil" para enganchar al que la
+# vea a seguir el perfil y esperar la siguiente.
+PHRASES_PER_PART_MIN = 30
+PHRASES_PER_PART_MAX = 40
+
+
+def generate_story_plan(topic: str) -> dict:
+    """Genera el plan completo de la historia y el contenido de la Parte 1."""
+    print(f"📝 Planificando historia sobre: {topic}")
 
     prompt = f"""
 Eres un creador de contenido viral para TikTok y YouTube Shorts en español.
-Crea una historia dramática corta estilo Reddit, narrada en primera persona ("yo"),
+Crea una historia dramática estilo Reddit, narrada en primera persona ("yo"),
 que gire en torno a esta premisa concreta:
 
 "{topic}"
 
-La historia debe ser muy adictiva, con un giro inesperado al final. Desarrolla
-libremente los detalles, nombres y personajes — la premisa es solo el punto de
-partida.
+La historia debe ser muy adictiva, con un giro inesperado hacia el final.
+Desarrolla libremente los detalles, nombres y personajes — la premisa es solo
+el punto de partida.
+
+Esta historia se va a publicar como una MINISERIE de 2 o 3 vídeos cortos (tú
+decides cuántos, según cuánto dé de sí la trama), en la que cada parte termina
+en un momento de máxima tensión para que el espectador quiera ver la
+siguiente en el perfil.
 
 Devuelve SOLO JSON válido, sin markdown ni explicaciones:
 
 {{
-  "title": "Título corto y llamativo (max 60 caracteres)",
+  "title": "Título corto y llamativo de la historia completa (max 60 caracteres)",
   "description": "Descripción para YouTube con emojis (max 150 caracteres)",
   "tags": ["shorts", "historia", "drama", "reddit", "viral"],
   "narrator_gender": "male o female — el género de quien narra en primera persona",
+  "total_parts": 2,
+  "outline": "Resumen en 4-6 frases de TODA la historia de principio a fin, incluido el giro final. Esto es solo para que tú mismo lo uses de guía al escribir las siguientes partes — el espectador NUNCA ve este resumen.",
   "phrases": [
     "Frase corta de máximo 6 palabras.",
     "Otra frase igual de corta.",
@@ -187,29 +207,115 @@ Devuelve SOLO JSON válido, sin markdown ni explicaciones:
 }}
 
 Reglas:
-- Entre 55 y 65 frases en total
+- "total_parts": pon 2 o 3 (el número entero, sin comillas), según lo que dé
+  de sí la historia. La mayoría de historias funcionan bien en 2 partes;
+  usa 3 solo si de verdad hay suficiente trama para justificarlo.
+- "phrases" es SOLO el guion de la Parte 1 (no de la historia entera)
+- Entre {PHRASES_PER_PART_MIN} y {PHRASES_PER_PART_MAX} frases en la Parte 1
 - Cada frase: máximo 6 palabras, impactante y clara
 - La primera frase debe enganchar al instante
-- Desarrolla la historia con MÁS contexto, escenas y detalles a lo largo del
-  relato (más personajes secundarios, diálogos breves, momentos intermedios)
-  antes de llegar al giro — no te quedes corto, aprovecha el espacio extra
-- Incluir giro dramático hacia el final
-- Terminar con una pregunta al espectador
+- Desarrolla la Parte 1 con contexto, escenas y algo de diálogo, pero SIN
+  llegar todavía al giro ni a la resolución — eso va en la(s) parte(s)
+  siguiente(s)
+- Termina la Parte 1 justo en un punto de máxima tensión o intriga (un
+  cliffhanger real, no resuelvas nada)
+- Las últimas 2 frases deben invitar de forma natural a ver la parte
+  siguiente, por ejemplo algo como "¿Qué hice después?" seguido de
+  "Parte 2 en mi perfil" — adáptalo al tono de la historia
 - "narrator_gender" debe ser exactamente "male" o "female"
 - Devolver SOLO el JSON
 """
 
     response = _generate_with_fallback(prompt, temperature=1.1)
-    content = json.loads(_clean_json(response.text))
+    plan = json.loads(_clean_json(response.text))
 
-    gender = content.get("narrator_gender", "female").strip().lower()
+    gender = plan.get("narrator_gender", "female").strip().lower()
     if gender not in VOICES:
         gender = "female"
-    content["narrator_gender"] = gender
-    content["topic"] = topic
+    plan["narrator_gender"] = gender
+    plan["topic"] = topic
 
-    print(f"✅ Historia: {content['title']}")
-    print(f"   {len(content['phrases'])} frases generadas — narrador: {gender}")
+    total_parts = plan.get("total_parts", 2)
+    try:
+        total_parts = int(total_parts)
+    except (TypeError, ValueError):
+        total_parts = 2
+    if total_parts not in (2, 3):
+        total_parts = 2
+    plan["total_parts"] = total_parts
+
+    print(f"✅ Historia: {plan['title']}")
+    print(f"   Planificada en {total_parts} parte(s) — narrador: {gender}")
+    print(f"   Parte 1: {len(plan['phrases'])} frases")
+    return plan
+
+
+def generate_story_continuation(plan: dict, part_num: int, previous_phrases: list) -> dict:
+    """Genera el guion de una parte siguiente (2 o 3), continuando la historia."""
+    total_parts = plan["total_parts"]
+    is_final = part_num == total_parts
+    print(f"📝 Generando Parte {part_num}/{total_parts}...")
+
+    # Le pasamos las últimas frases ya narradas como ancla de continuidad,
+    # sin mandar la historia entera (innecesario y más caro en tokens).
+    recap = " ".join(previous_phrases[-18:])
+
+    if is_final:
+        ending_rule = (
+            "- Esta es la parte FINAL de la historia: resuelve el giro dramático "
+            "planteado en el resumen, dale un cierre satisfactorio y termina con "
+            "una pregunta directa al espectador (no invites a ver ninguna parte más)"
+        )
+    else:
+        ending_rule = (
+            f"- Esta NO es la parte final (quedan más partes después). Termina de "
+            f"nuevo en un punto de máxima tensión, sin resolver el giro principal. "
+            f"Las últimas 2 frases deben invitar de forma natural a ver la parte "
+            f"siguiente, por ejemplo algo como 'Parte {part_num + 1} en mi perfil'"
+        )
+
+    prompt = f"""
+Estás continuando una miniserie dramática de TikTok en español, narrada en
+primera persona ("yo"). Esta es la Parte {part_num} de {total_parts}.
+
+Resumen completo de la historia (guía interna tuya, el espectador no lo ve):
+"{plan['outline']}"
+
+Esto es literalmente lo último que ya se narró en la parte anterior (el
+espectador ya lo escuchó — NO lo repitas, continúa justo a partir de ahí):
+"{recap}"
+
+Devuelve SOLO JSON válido, sin markdown ni explicaciones:
+
+{{
+  "phrases": [
+    "Frase corta de máximo 6 palabras.",
+    "..."
+  ]
+}}
+
+Reglas:
+- Empieza EN SECO, directamente donde lo dejaste — sin ningún "recordemos"
+  ni resumen de lo anterior, como si no hubiera corte
+- Entre {PHRASES_PER_PART_MIN} y {PHRASES_PER_PART_MAX} frases
+- Cada frase: máximo 6 palabras, impactante y clara
+{ending_rule}
+- Devolver SOLO el JSON
+"""
+
+    response = _generate_with_fallback(prompt, temperature=1.1)
+    part_content = json.loads(_clean_json(response.text))
+
+    content = {
+        "title":           plan["title"],
+        "description":     plan["description"],
+        "tags":            plan["tags"],
+        "narrator_gender": plan["narrator_gender"],
+        "topic":           plan["topic"],
+        "phrases":         part_content["phrases"],
+    }
+
+    print(f"✅ Parte {part_num}/{total_parts}: {len(content['phrases'])} frases generadas")
     return content
 
 
@@ -322,8 +428,9 @@ def _concat_audio_seamless(chunk_paths: list, output_path: Path):
     subprocess.run(cmd, check=True, capture_output=True)
 
 
-def generate_audio(content: dict, run_id: str) -> tuple:
-    voice = random.choice(VOICES[content["narrator_gender"]])
+def generate_audio(content: dict, run_id: str, voice: str) -> tuple:
+    # La voz se elige UNA vez por historia (en main) y se reutiliza en todas
+    # sus partes, para que no cambie de narrador a media miniserie.
     print(f"\n🎙️ Generando narración con Edge TTS ({voice}, {SPEECH_RATE})...")
 
     phrases     = content["phrases"]
@@ -427,7 +534,8 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
         f.writelines(lines)
 
 
-def assemble_video(content: dict, audio_path: str, timestamps: list, run_id: str) -> str:
+def assemble_video(content: dict, audio_path: str, timestamps: list, run_id: str,
+                    part_num: int = None, total_parts: int = None) -> str:
     print("\n✂️  Montando vídeo con FFmpeg...")
 
     total_duration = get_duration(audio_path)
@@ -452,7 +560,8 @@ def assemble_video(content: dict, audio_path: str, timestamps: list, run_id: str
     safe_title = "".join(
         c if c.isalnum() or c in " _-" else "" for c in content["title"]
     ).strip()
-    output_path = SHORTS_DIR / f"{safe_title} [{run_id}].mp4"
+    part_suffix = f" Parte {part_num}-{total_parts}" if part_num and total_parts else ""
+    output_path = SHORTS_DIR / f"{safe_title}{part_suffix} [{run_id}].mp4"
 
     # TikTok solo admite subir el borrador como UN único trozo de máx. 64MB
     # (no acepta trocear en varios). Con historias más largas, un bitrate
@@ -489,9 +598,13 @@ def assemble_video(content: dict, audio_path: str, timestamps: list, run_id: str
 
 
 # ── PASO 4: Guardar metadatos ─────────────────────────────────────────────────
-def save_metadata(content: dict, video_path: str, run_id: str) -> dict:
+def save_metadata(content: dict, video_path: str, run_id: str,
+                   part_num: int = None, total_parts: int = None) -> dict:
+    title = content["title"]
+    if part_num and total_parts:
+        title = f"{title} (Parte {part_num}/{total_parts})"
     metadata = {
-        "title":       content["title"],
+        "title":       title,
         "description": content["description"],
         "tags":        content["tags"],
         "video_path":  video_path,
@@ -516,6 +629,27 @@ def build_tiktok_caption(content: dict) -> str:
     return caption[:2200]  # límite de TikTok (caracteres UTF-16)
 
 
+def _upload_part(video_path: str, content: dict) -> str:
+    """Sube una parte a TikTok y devuelve el publish_id (o None si falla)."""
+    try:
+        if TIKTOK_UPLOAD_MODE == "direct_post":
+            caption = build_tiktok_caption(content)
+            publish_id = upload_video_direct_post(video_path, caption)
+        else:
+            publish_id = upload_video_as_draft(video_path)
+
+        # Se añade una línea por parte subida, para que el workflow de
+        # GitHub Actions pueda comprobar el estado real de CADA vídeo
+        # (con tiktok_check_status.py) sin depender del móvil.
+        with open("last_publish_id.txt", "a", encoding="utf-8") as f:
+            f.write(publish_id + "\n")
+        return publish_id
+    except Exception as e:
+        print(f"⚠️ No se pudo subir a TikTok automáticamente: {e}")
+        print("   El vídeo sigue en tu carpeta, puedes subirlo a mano.")
+        return None
+
+
 # ── MAIN ──────────────────────────────────────────────────────────────────────
 def main():
     if not BACKGROUND.exists():
@@ -527,37 +661,51 @@ def main():
     print("🚀 TikTok/Shorts — Reddit Story Pipeline")
     print("=" * 50)
 
-    run_id = uuid.uuid4().hex[:8]
+    # Empieza el archivo de publish_ids en blanco en cada ejecución
+    open("last_publish_id.txt", "w", encoding="utf-8").close()
 
-    topics                  = generate_topics()
-    topic                   = random.choice(topics)
-    content                 = generate_story(topic)
-    audio_path, timestamps  = generate_audio(content, run_id)
-    video_path              = assemble_video(content, audio_path, timestamps, run_id)
-    metadata                = save_metadata(content, video_path, run_id)
+    topics = generate_topics()
+    topic  = random.choice(topics)
+    plan   = generate_story_plan(topic)
 
-    if AUTO_UPLOAD_TIKTOK:
-        try:
-            if TIKTOK_UPLOAD_MODE == "direct_post":
-                caption = build_tiktok_caption(content)
-                publish_id = upload_video_direct_post(video_path, caption)
-            else:
-                publish_id = upload_video_as_draft(video_path)
+    total_parts = plan["total_parts"]
+    # Misma voz para TODAS las partes de la historia, para que el narrador
+    # no cambie de un vídeo al siguiente.
+    voice = random.choice(VOICES[plan["narrator_gender"]])
 
-            # Guarda el publish_id en un archivo para que, por ejemplo, el
-            # workflow de GitHub Actions pueda comprobar el estado real
-            # justo después (con tiktok_check_status.py) sin depender del móvil.
-            with open("last_publish_id.txt", "w", encoding="utf-8") as f:
-                f.write(publish_id)
-        except Exception as e:
-            print(f"⚠️ No se pudo subir a TikTok automáticamente: {e}")
-            print("   El vídeo sigue en tu carpeta, puedes subirlo a mano.")
+    print(f"\n📚 '{plan['title']}' se publicará en {total_parts} parte(s), voz: {voice}")
+
+    all_phrases = []
+    results = []
+
+    for part_num in range(1, total_parts + 1):
+        print("\n" + "-" * 50)
+        print(f"▶️  Parte {part_num}/{total_parts}")
+
+        if part_num == 1:
+            content = plan  # ya trae 'phrases' de la Parte 1
+        else:
+            content = generate_story_continuation(plan, part_num, all_phrases)
+
+        all_phrases.extend(content["phrases"])
+
+        run_id = uuid.uuid4().hex[:8]
+        audio_path, timestamps = generate_audio(content, run_id, voice)
+        video_path = assemble_video(content, audio_path, timestamps, run_id, part_num, total_parts)
+        metadata = save_metadata(content, video_path, run_id, part_num, total_parts)
+
+        publish_id = None
+        if AUTO_UPLOAD_TIKTOK:
+            publish_id = _upload_part(video_path, content)
+
+        results.append((metadata["title"], video_path, publish_id))
 
     print("\n" + "=" * 50)
-    print("🎉 ¡Short completado!")
-    print(f"📱  Vídeo:  {video_path}")
-    print(f"📋  Título: {metadata['title']}")
-    print("\n➡️  Revisa el borrador en TikTok y publícalo desde el móvil")
+    print(f"🎉 ¡Miniserie completada! ({total_parts} parte(s))")
+    for title, video_path, publish_id in results:
+        estado = "subido" if publish_id else "NO subido (revisar arriba)"
+        print(f"📱 {title} — {video_path} — {estado}")
+    print("\n➡️  Revisa los borradores en TikTok y publícalos desde el móvil, en orden")
 
 
 if __name__ == "__main__":
