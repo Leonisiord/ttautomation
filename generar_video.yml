@@ -1,0 +1,73 @@
+name: Generar y subir short a TikTok
+ 
+on:
+  schedule:
+    # 08:00 UTC = 09:00 hora de Canarias en horario de verano (ajusta si quieres otra hora)
+    - cron: "0 8 * * *"
+  workflow_dispatch: {}   # te deja lanzarlo también a mano desde la pestaña "Actions" de GitHub
+ 
+jobs:
+  generar:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+ 
+    steps:
+      - name: Descargar el código del repo
+        uses: actions/checkout@v4
+ 
+      - name: Preparar Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+ 
+      - name: Instalar ffmpeg
+        run: sudo apt-get update -qq && sudo apt-get install -y ffmpeg
+ 
+      - name: Instalar dependencias de Python
+        run: pip install edge-tts python-dotenv google-genai requests
+ 
+      # El vídeo de fondo (553MB) se guarda en caché para no descargarlo en cada ejecución
+      - name: Restaurar vídeo de fondo desde caché
+        id: cache-bg
+        uses: actions/cache@v4
+        with:
+          path: background.mp4
+          key: background-video-v1
+ 
+      - name: Descargar vídeo de fondo (solo si no está en caché)
+        if: steps.cache-bg.outputs.cache-hit != 'true'
+        run: curl -sSL -o background.mp4 "https://github.com/Leonisiord/ttautomation/releases/download/video/background.mp4"
+ 
+      - name: Restaurar tokens de TikTok desde caché
+        id: cache-tokens
+        uses: actions/cache/restore@v4
+        with:
+          path: tiktok_tokens.json
+          key: tiktok-tokens-${{ github.run_id }}
+          restore-keys: |
+            tiktok-tokens-
+ 
+      - name: Usar los tokens guardados como secret si no hay caché todavía
+        run: |
+          if [ ! -f tiktok_tokens.json ]; then
+            echo '${{ secrets.TIKTOK_TOKENS_JSON }}' > tiktok_tokens.json
+          fi
+ 
+      - name: Crear archivo .env con las claves
+        run: |
+          cat <<EOF > .env
+          GEMINI_API_KEY=${{ secrets.GEMINI_API_KEY }}
+          TIKTOK_CLIENT_KEY=${{ secrets.TIKTOK_CLIENT_KEY }}
+          TIKTOK_CLIENT_SECRET=${{ secrets.TIKTOK_CLIENT_SECRET }}
+          TIKTOK_REDIRECT_URI=${{ secrets.TIKTOK_REDIRECT_URI }}
+          EOF
+ 
+      - name: Ejecutar el pipeline (genera y sube el short)
+        run: python main_reddit.py
+ 
+      - name: Guardar los tokens actualizados en caché para la próxima vez
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: tiktok_tokens.json
+          key: tiktok-tokens-${{ github.run_id }}
