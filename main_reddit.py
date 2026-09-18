@@ -44,6 +44,36 @@ if not GEMINI_API_KEY:
 
 gemini = genai.Client(api_key=GEMINI_API_KEY)
 
+# Orden de preferencia de modelos: prueba primero el mejor (más calidad).
+# Si falla por lo que sea (sin cuota, saturado, error del servidor,
+# timeout...) cae automáticamente al siguiente de la lista, sin interrumpir
+# el pipeline. Solo si TODOS fallan se detiene y avisa del último error.
+MODEL_PRIORITY = ["gemini-2.5-pro", "gemini-3.5-flash", "gemini-3.5-flash-lite"]
+
+
+def _generate_with_fallback(prompt: str, temperature: float):
+    last_error = None
+    for i, model in enumerate(MODEL_PRIORITY):
+        try:
+            response = gemini.models.generate_content(
+                model=model,
+                contents=prompt,
+                config={"temperature": temperature},
+            )
+            if i > 0:
+                print(f"  ℹ️ Usando modelo de respaldo: {model}")
+            return response
+        except Exception as e:
+            last_error = e
+            is_last = (i == len(MODEL_PRIORITY) - 1)
+            reason = f"{type(e).__name__}: {e}"
+            if is_last:
+                print(f"  ❌ {model} también falló — no quedan más modelos de respaldo. Motivo: {reason}")
+            else:
+                print(f"  ⚠️ {model} falló (saturado / sin cuota / error), probando el siguiente modelo... Motivo: {reason}")
+            continue
+    raise last_error
+
 BACKGROUND = Path("background.mp4")
 FONT_NAME  = "Arial"
 
@@ -112,11 +142,7 @@ Devuelve SOLO JSON, sin markdown:
 {{"topics": ["premisa 1", "premisa 2", "..."]}}
 """
 
-    response = gemini.models.generate_content(
-        model="gemini-3.5-flash",
-        contents=prompt,
-        config={"temperature": 1.3},
-    )
+    response = _generate_with_fallback(prompt, temperature=1.3)
     data = json.loads(_clean_json(response.text))
     topics = data["topics"]
     print(f"✅ {len(topics)} premisas generadas")
@@ -165,11 +191,7 @@ Reglas:
 - Devolver SOLO el JSON
 """
 
-    response = gemini.models.generate_content(
-        model="gemini-3.5-flash",
-        contents=prompt,
-        config={"temperature": 1.1},
-    )
+    response = _generate_with_fallback(prompt, temperature=1.1)
     content = json.loads(_clean_json(response.text))
 
     gender = content.get("narrator_gender", "female").strip().lower()
