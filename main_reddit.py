@@ -107,6 +107,14 @@ TTS_CHUNK_SIZE = 6
 # minuto 0 y este límite), para no repetir siempre las mismas imágenes.
 BACKGROUND_MAX_START_MIN = 28
 
+# TikTok solo admite subir el borrador como UN único trozo de máx. 64MB
+# (no admite trocear en varios, lo hemos comprobado). Con historias más
+# largas, un bitrate de vídeo fijo podía hacer que el archivo final
+# superase ese límite — así que el bitrate se calcula dinámicamente según
+# la duración de la historia para que el peso final quede siempre por
+# debajo de este umbral, con margen de sobra.
+MAX_UPLOAD_MB = 55
+
 OUTPUT_DIR = Path("output")
 SHORTS_DIR = OUTPUT_DIR / "shorts"
 
@@ -446,7 +454,16 @@ def assemble_video(content: dict, audio_path: str, timestamps: list, run_id: str
     ).strip()
     output_path = SHORTS_DIR / f"{safe_title} [{run_id}].mp4"
 
-    print(f"  Ensamblando vídeo vertical 1080x1920...", end=" ", flush=True)
+    # TikTok solo admite subir el borrador como UN único trozo de máx. 64MB
+    # (no acepta trocear en varios). Con historias más largas, un bitrate
+    # fijo podía superar ese límite — así que calculamos el bitrate de vídeo
+    # según la duración, para que el archivo final quede siempre por debajo
+    # de MAX_UPLOAD_MB, con margen de sobra.
+    audio_kbps = 128
+    target_kbps = int((MAX_UPLOAD_MB * 8 * 1024) / total_duration)
+    video_kbps = max(600, target_kbps - audio_kbps)  # nunca bajar de una calidad mínima decente
+
+    print(f"  Ensamblando vídeo vertical 1080x1920 ({video_kbps}kbps vídeo, objetivo <{MAX_UPLOAD_MB}MB)...", end=" ", flush=True)
     subprocess.run([
         "ffmpeg", "-y",
         "-ss", f"{bg_start:.2f}",       # Arranca en un punto aleatorio del fondo
@@ -457,7 +474,8 @@ def assemble_video(content: dict, audio_path: str, timestamps: list, run_id: str
         "-map", "1:a:0",                # Audio: SOLO la narración TTS
         "-vf", vf_chain,
         "-c:v", "libx264", "-preset", "fast",
-        "-c:a", "aac", "-b:a", "128k",
+        "-b:v", f"{video_kbps}k", "-maxrate", f"{int(video_kbps * 1.2)}k", "-bufsize", f"{video_kbps * 2}k",
+        "-c:a", "aac", "-b:a", f"{audio_kbps}k",
         "-pix_fmt", "yuv420p",
         "-t", str(total_duration),     # Duración exacta de la narración
         "-shortest",
