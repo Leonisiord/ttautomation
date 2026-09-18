@@ -5,7 +5,9 @@ on:
     # 08:00 UTC = 09:00 hora de Canarias en horario de verano (ajusta si quieres otra hora)
     - cron: "0 */3 * * *"
   workflow_dispatch: {}   # te deja lanzarlo también a mano desde la pestaña "Actions" de GitHub
- 
+  concurrency:
+     group: generar-video
+     cancel-in-progress: false
 jobs:
   generar:
     runs-on: ubuntu-latest
