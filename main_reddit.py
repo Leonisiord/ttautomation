@@ -48,7 +48,7 @@ gemini = genai.Client(api_key=GEMINI_API_KEY)
 # Si falla por lo que sea (sin cuota, saturado, error del servidor,
 # timeout...) cae automáticamente al siguiente de la lista, sin interrumpir
 # el pipeline. Solo si TODOS fallan se detiene y avisa del último error.
-MODEL_PRIORITY = ["gemini-2.5-pro", "gemini-3.5-flash", "gemini-3.5-flash-lite"]
+MODEL_PRIORITY = ["gemini-3.1-pro-preview", "gemini-3.5-flash", "gemini-3.5-flash-lite"]
 
 
 def _generate_with_fallback(prompt: str, temperature: float):

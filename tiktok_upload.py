@@ -94,6 +94,8 @@ def upload_video_as_draft(video_path: str) -> str:
         access_token = tokens["access_token"]
         init_response = _init_upload(access_token, video_size)
 
+    if not init_response.ok:
+        print(f"  ❌ TikTok respondió {init_response.status_code}: {init_response.text}")
     init_response.raise_for_status()
     init_data = init_response.json()
 
