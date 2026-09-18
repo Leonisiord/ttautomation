@@ -113,7 +113,7 @@ Devuelve SOLO JSON, sin markdown:
 """
 
     response = gemini.models.generate_content(
-        model="gemini-3.5-flash-lite",
+        model="gemini-3.5-flash",
         contents=prompt,
         config={"temperature": 1.3},
     )
@@ -153,10 +153,12 @@ Devuelve SOLO JSON válido, sin markdown ni explicaciones:
 }}
 
 Reglas:
-- Entre 35 y 45 frases en total
+- Entre 55 y 65 frases en total
 - Cada frase: máximo 6 palabras, impactante y clara
 - La primera frase debe enganchar al instante
-- Desarrolla la historia con más contexto y detalles antes del giro
+- Desarrolla la historia con MÁS contexto, escenas y detalles a lo largo del
+  relato (más personajes secundarios, diálogos breves, momentos intermedios)
+  antes de llegar al giro — no te quedes corto, aprovecha el espacio extra
 - Incluir giro dramático hacia el final
 - Terminar con una pregunta al espectador
 - "narrator_gender" debe ser exactamente "male" o "female"
@@ -164,7 +166,7 @@ Reglas:
 """
 
     response = gemini.models.generate_content(
-        model="gemini-3.5-flash-lite",
+        model="gemini-3.5-flash",
         contents=prompt,
         config={"temperature": 1.1},
     )
@@ -498,9 +500,15 @@ def main():
         try:
             if TIKTOK_UPLOAD_MODE == "direct_post":
                 caption = build_tiktok_caption(content)
-                upload_video_direct_post(video_path, caption)
+                publish_id = upload_video_direct_post(video_path, caption)
             else:
-                upload_video_as_draft(video_path)
+                publish_id = upload_video_as_draft(video_path)
+
+            # Guarda el publish_id en un archivo para que, por ejemplo, el
+            # workflow de GitHub Actions pueda comprobar el estado real
+            # justo después (con tiktok_check_status.py) sin depender del móvil.
+            with open("last_publish_id.txt", "w", encoding="utf-8") as f:
+                f.write(publish_id)
         except Exception as e:
             print(f"⚠️ No se pudo subir a TikTok automáticamente: {e}")
             print("   El vídeo sigue en tu carpeta, puedes subirlo a mano.")
