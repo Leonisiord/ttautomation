@@ -2,17 +2,22 @@ name: Generar y subir short a TikTok
  
 on:
   schedule:
-    - cron: "0 */3 * * *"
-  workflow_dispatch: {}
-
+    - cron: "0 */3 * * *"   # cada 3 horas
+  workflow_dispatch: {}   # te deja lanzarlo también a mano desde la pestaña "Actions" de GitHub
+ 
+# Si ya hay una ejecución en marcha (programada o manual), la siguiente
+# espera en cola en vez de correr en paralelo — evita que dos ejecuciones
+# se pisen al guardar los tokens de TikTok.
 concurrency:
   group: generar-video
   cancel-in-progress: false
-
+ 
 jobs:
   generar:
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    # Ahora cada ejecución genera y sube 2 o 3 vídeos (una historia en varias
+    # partes), así que necesita más margen que cuando era solo uno.
+    timeout-minutes: 45
  
     steps:
       - name: Descargar el código del repo
@@ -67,6 +72,20 @@ jobs:
  
       - name: Ejecutar el pipeline (genera y sube el short)
         run: python main_reddit.py
+ 
+      - name: Comprobar el estado real en TikTok
+        if: always()
+        run: |
+          if [ -s last_publish_id.txt ]; then
+            sleep 20
+            while IFS= read -r pid; do
+              [ -z "$pid" ] && continue
+              echo "── Comprobando $pid ──"
+              python tiktok_check_status.py "$pid"
+            done < last_publish_id.txt
+          else
+            echo "No hay ningún publish_id — ninguna subida llegó a completarse."
+          fi
  
       - name: Guardar los tokens actualizados en caché para la próxima vez
         if: always()
