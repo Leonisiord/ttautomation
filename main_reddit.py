@@ -21,6 +21,7 @@ from pathlib import Path
 import edge_tts
 from dotenv import load_dotenv
 from google import genai
+from PIL import Image, ImageDraw, ImageFont
 from tiktok_upload import upload_video_as_draft, upload_video_direct_post
 
 # Pon esto en False si alguna vez quieres generar el vídeo sin subirlo
@@ -74,7 +75,10 @@ def _generate_with_fallback(prompt: str, temperature: float):
             continue
     raise last_error
 
-BACKGROUND = Path("background.mp4")
+# Carpeta con uno o varios vídeos de fondo (.mp4). En cada parte se elige
+# uno al azar de los que haya ahí dentro — cuantos más pongas, menos se
+# repiten las imágenes de fondo entre vídeos.
+BACKGROUNDS_DIR = Path("backgrounds")
 FONT_NAME  = "Arial"
 
 # Pool de voces según el género del narrador (primera persona de la historia).
@@ -114,6 +118,19 @@ BACKGROUND_MAX_START_MIN = 28
 # la duración de la historia para que el peso final quede siempre por
 # debajo de este umbral, con margen de sobra.
 MAX_UPLOAD_MB = 55
+
+# ── Tarjeta de título (el "gancho") ────────────────────────────────────────
+# En vez de un simple fondo de texto, el gancho se dibuja como una imagen
+# aparte: un recuadro ESTÁTICO de esquinas redondeadas (tamaño fijo, no
+# cambia de forma según el texto), fondo blanco, borde negro, con el
+# nombre de la cuenta en la esquina inferior derecha. Se pega encima del
+# vídeo con FFmpeg solo mientras dura el gancho, y luego desaparece.
+TIKTOK_HANDLE   = "@quehariastustories"
+CARD_WIDTH      = 860   # ancho fijo del recuadro, en píxeles (el vídeo es de 1080 de ancho)
+CARD_PADDING    = 55    # margen interno entre el borde y el texto
+CARD_RADIUS     = 48    # radio de las esquinas redondeadas
+CARD_BORDER     = 8     # grosor del borde negro
+CARD_MIN_HEIGHT = 260   # alto mínimo, por si el gancho es una frase muy corta
 
 OUTPUT_DIR = Path("output")
 SHORTS_DIR = OUTPUT_DIR / "shorts"
@@ -166,8 +183,8 @@ Devuelve SOLO JSON, sin markdown:
 # fácil de acertar para cualquier modelo), se convierte en su propio vídeo, y
 # termina con un gancho tipo "Parte 2 en mi perfil" para enganchar al que la
 # vea a seguir el perfil y esperar la siguiente.
-PHRASES_PER_PART_MIN = 30
-PHRASES_PER_PART_MAX = 40
+PHRASES_PER_PART_MIN = 32
+PHRASES_PER_PART_MAX = 42
 
 
 def generate_story_plan(topic: str) -> dict:
@@ -198,6 +215,7 @@ Devuelve SOLO JSON válido, sin markdown ni explicaciones:
   "tags": ["shorts", "historia", "drama", "reddit", "viral"],
   "narrator_gender": "male o female — el género de quien narra en primera persona",
   "total_parts": 2,
+  "hook": "Frase titular tipo clickbait que resume la historia entera de un tirón, con premisa + un adelanto del desenlace o la victoria (ej: 'Mi suegra intentó arruinar mi boda y le hice pagar hasta el último centavo'). Se dice literalmente como la primera frase del vídeo, antes de empezar a narrar — sin límite de palabras, como un titular real.",
   "outline": "Resumen en 4-6 frases de TODA la historia de principio a fin, incluido el giro final. Esto es solo para que tú mismo lo uses de guía al escribir las siguientes partes — el espectador NUNCA ve este resumen.",
   "phrases": [
     "Frase corta de máximo 6 palabras.",
@@ -210,10 +228,15 @@ Reglas:
 - "total_parts": pon 2 o 3 (el número entero, sin comillas), según lo que dé
   de sí la historia. La mayoría de historias funcionan bien en 2 partes;
   usa 3 solo si de verdad hay suficiente trama para justificarlo.
-- "phrases" es SOLO el guion de la Parte 1 (no de la historia entera)
+- "hook" es UNA sola frase completa, tipo titular de noticia, que da
+  curiosidad por saber CÓMO pasó, sin explicar los detalles — no hace falta
+  que sea corta ni seguir la regla de 6 palabras, es la excepción
+- "phrases" es SOLO el guion de la Parte 1 (no de la historia entera, y no
+  incluye el "hook" — ese se añade aparte al principio del vídeo)
 - Entre {PHRASES_PER_PART_MIN} y {PHRASES_PER_PART_MAX} frases en la Parte 1
 - Cada frase: máximo 6 palabras, impactante y clara
-- La primera frase debe enganchar al instante
+- Como el "hook" ya engancha al principio, la primera frase de "phrases"
+  puede simplemente empezar a plantar la escena con normalidad
 - Desarrolla la Parte 1 con contexto, escenas y algo de diálogo, pero SIN
   llegar todavía al giro ni a la resolución — eso va en la(s) parte(s)
   siguiente(s)
@@ -244,10 +267,31 @@ Reglas:
         total_parts = 2
     plan["total_parts"] = total_parts
 
+    # Por si Gemini se olvida del campo (raro, pero el modelo de respaldo a
+    # veces se salta campos) — usamos el título como red de seguridad.
+    hook = plan.get("hook", "").strip()
+    if not hook:
+        hook = plan["title"]
+    plan["hook"] = hook
+
     print(f"✅ Historia: {plan['title']}")
+    print(f"   Gancho: {plan['hook']}")
     print(f"   Planificada en {total_parts} parte(s) — narrador: {gender}")
     print(f"   Parte 1: {len(plan['phrases'])} frases")
     return plan
+
+
+def build_hook_line(plan: dict, part_num: int) -> str:
+    """
+    La frase titular con la que arranca CADA parte del vídeo (antes de la
+    narración en sí). En la Parte 1 es el gancho tal cual; en las
+    siguientes se le añade "Parte N" al final, para que quien la vea sin
+    contexto sepa al instante que es la continuación de la misma historia.
+    """
+    hook = plan["hook"].strip()
+    if part_num > 1:
+        return f"{hook} — Parte {part_num}"
+    return hook
 
 
 def generate_story_continuation(plan: dict, part_num: int, previous_phrases: list) -> dict:
@@ -262,7 +306,7 @@ def generate_story_continuation(plan: dict, part_num: int, previous_phrases: lis
     # gancho — si no, Gemini intentaría continuar literalmente desde la
     # frase de "mira la siguiente parte", que no tiene sentido narrativo.
     story_phrases = previous_phrases[:-2] if len(previous_phrases) > 2 else previous_phrases
-    recap = " ".join(story_phrases[-18:])
+    recap = " ".join(story_phrases[-60:])
     last_lines = " / ".join(story_phrases[-2:])
 
     if is_final:
@@ -497,14 +541,27 @@ def unix_path(p) -> str:
     return str(p).replace("\\", "/")
 
 
-def pick_background_start(total_duration: float) -> float:
+def pick_background() -> Path:
+    """Elige al azar uno de los vídeos de fondo disponibles en BACKGROUNDS_DIR."""
+    candidates = sorted(BACKGROUNDS_DIR.glob("*.mp4"))
+    if not candidates:
+        raise FileNotFoundError(
+            f"❌ No hay ningún vídeo de fondo en '{BACKGROUNDS_DIR}/'.\n"
+            "   Pon al menos un .mp4 ahí dentro antes de ejecutar."
+        )
+    background = random.choice(candidates)
+    print(f"  🎞️ Fondo elegido: {background.name}")
+    return background
+
+
+def pick_background_start(background: Path, total_duration: float) -> float:
     """
-    Elige un punto de arranque aleatorio dentro de background.mp4 (entre 0
+    Elige un punto de arranque aleatorio dentro del vídeo de fondo (entre 0
     y BACKGROUND_MAX_START_MIN), asegurando que quede metraje suficiente
     por delante para cubrir la duración del short sin tener que dar la
     vuelta al vídeo.
     """
-    bg_duration = get_duration(str(BACKGROUND))
+    bg_duration = get_duration(str(background))
     max_start = min(BACKGROUND_MAX_START_MIN * 60, bg_duration - total_duration - 5)
     max_start = max(max_start, 0)
     start = random.uniform(0, max_start) if max_start > 0 else 0.0
@@ -521,11 +578,13 @@ def format_ass_time(seconds: float) -> str:
     return f"{h}:{m:02d}:{s:02d}.{cs:02d}"
 
 
-def build_subtitles(phrases: list, timestamps: list, srt_path: Path):
+def build_subtitles(phrases: list, timestamps: list, srt_path: Path, hook_lines: int = 1):
     """
-    Genera un archivo .ass con estilo grande, blanco con borde negro,
-    centrado — como los subtítulos de TikTok. Un archivo .ass escala
-    perfectamente aunque haya 100 frases; encadenar drawtext no.
+    Genera un archivo .ass con el estilo normal de subtítulos (grande,
+    blanco con borde negro, centrado). La(s) primera(s) frase(s) —el
+    gancho— NO se escriben aquí: esas se muestran con la tarjeta-imagen de
+    build_hook_card()/pegada con 'overlay' en FFmpeg, así que se saltan
+    para no duplicar el texto en pantalla.
     """
     header = f"""[Script Info]
 ScriptType: v4.00+
@@ -541,7 +600,9 @@ Style: Default,{FONT_NAME},78,&H00FFFFFF,&H000000FF,&H00000000,&H00000000,1,0,0,
 Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
 """
     lines = [header]
-    for phrase, (start, end) in zip(phrases, timestamps):
+    for i, (phrase, (start, end)) in enumerate(zip(phrases, timestamps)):
+        if i < hook_lines:
+            continue
         text = phrase.replace("\n", " ").replace("{", "(").replace("}", ")")
         lines.append(
             f"Dialogue: 0,{format_ass_time(start)},{format_ass_time(end)},"
@@ -552,28 +613,124 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
         f.writelines(lines)
 
 
+def _resolve_font_path(bold: bool = True) -> str:
+    """Busca la ruta real de la fuente Arial (o su equivalente) instalada en el sistema."""
+    query = f"{FONT_NAME}:bold" if bold else FONT_NAME
+    try:
+        result = subprocess.run(
+            ["fc-match", "-f", "%{file}", query],
+            capture_output=True, text=True, check=True,
+        )
+        path = result.stdout.strip()
+        if path and os.path.exists(path):
+            return path
+    except Exception:
+        pass
+    # Ruta habitual en Ubuntu / GitHub Actions si fc-match no está disponible
+    fallback = "/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf"
+    return fallback if os.path.exists(fallback) else None
+
+
+def _wrap_text_to_width(draw: ImageDraw.ImageDraw, text: str, font: ImageFont.FreeTypeFont, max_width: int) -> list:
+    words = text.split()
+    lines, current = [], ""
+    for word in words:
+        candidate = f"{current} {word}".strip()
+        width = draw.textbbox((0, 0), candidate, font=font)[2]
+        if width <= max_width or not current:
+            current = candidate
+        else:
+            lines.append(current)
+            current = word
+    if current:
+        lines.append(current)
+    return lines
+
+
+def build_hook_card(hook_text: str, card_path: Path) -> tuple:
+    """
+    Dibuja la tarjeta del gancho como un PNG con transparencia: recuadro
+    ESTÁTICO de esquinas redondeadas (fondo blanco, borde negro grueso),
+    con el texto del gancho centrado dentro y el nombre de la cuenta en
+    la esquina inferior derecha. El tamaño de la tarjeta se ajusta solo al
+    número de líneas que ocupe el texto, pero la forma (esquinas
+    redondeadas, grosor de borde) es siempre la misma.
+    Devuelve (ruta_png, ancho, alto).
+    """
+    font_path = _resolve_font_path(bold=True)
+    title_font  = ImageFont.truetype(font_path, 54) if font_path else ImageFont.load_default()
+    handle_font = ImageFont.truetype(font_path, 28) if font_path else ImageFont.load_default()
+
+    tmp_img  = Image.new("RGBA", (10, 10))
+    tmp_draw = ImageDraw.Draw(tmp_img)
+
+    max_text_width = CARD_WIDTH - 2 * CARD_PADDING
+    lines = _wrap_text_to_width(tmp_draw, hook_text, title_font, max_text_width)
+
+    ascent, descent = title_font.getmetrics()
+    line_height = ascent + descent + 16
+    handle_ascent, handle_descent = handle_font.getmetrics()
+    handle_block = handle_ascent + handle_descent + 24
+
+    card_height = max(
+        CARD_MIN_HEIGHT,
+        CARD_PADDING * 2 + line_height * len(lines) + handle_block,
+    )
+    card_width = CARD_WIDTH
+
+    img = Image.new("RGBA", (card_width, card_height), (0, 0, 0, 0))
+    draw = ImageDraw.Draw(img)
+
+    half_border = CARD_BORDER / 2
+    draw.rounded_rectangle(
+        [half_border, half_border, card_width - half_border, card_height - half_border],
+        radius=CARD_RADIUS,
+        fill=(255, 255, 255, 255),
+        outline=(0, 0, 0, 255),
+        width=CARD_BORDER,
+    )
+
+    y = CARD_PADDING
+    for line in lines:
+        w = draw.textbbox((0, 0), line, font=title_font)[2]
+        x = (card_width - w) / 2
+        draw.text((x, y), line, font=title_font, fill=(0, 0, 0, 255))
+        y += line_height
+
+    handle_w = draw.textbbox((0, 0), TIKTOK_HANDLE, font=handle_font)[2]
+    draw.text(
+        (card_width - CARD_PADDING - handle_w, card_height - CARD_PADDING - handle_ascent),
+        TIKTOK_HANDLE, font=handle_font, fill=(120, 120, 120, 255),
+    )
+
+    img.save(card_path)
+    return str(card_path), card_width, card_height
+
+
 def assemble_video(content: dict, audio_path: str, timestamps: list, run_id: str,
                     part_num: int = None, total_parts: int = None) -> str:
     print("\n✂️  Montando vídeo con FFmpeg...")
 
     total_duration = get_duration(audio_path)
-    bg_start = pick_background_start(total_duration)
+    background = pick_background()
+    bg_start = pick_background_start(background, total_duration)
 
-    # Generar archivo de subtítulos .ass sincronizado con el audio
+    # Generar archivo de subtítulos .ass sincronizado con el audio (sin el
+    # gancho, que se muestra aparte con la tarjeta-imagen de abajo)
     phrases = content["phrases"]
     subs_path = OUTPUT_DIR / f"story_{run_id}.ass"
-    build_subtitles(phrases, timestamps, subs_path)
+    build_subtitles(phrases, timestamps, subs_path, hook_lines=1)
 
     # FFmpeg necesita la ruta del filtro subtitles con los dos puntos
     # de la unidad escapados (C:/...) y entre comillas simples
     subs_filter_path = unix_path(subs_path.resolve()).replace(":", "\\:")
 
-    # Cadena de filtros: escalar + recortar a vertical + subtítulos
-    vf_chain = (
-        "scale=1080:1920:force_original_aspect_ratio=increase,"
-        "crop=1080:1920,"
-        f"subtitles='{subs_filter_path}'"
-    )
+    # Tarjeta del gancho: recuadro de esquinas redondeadas con el titular,
+    # se pega sobre el vídeo solo durante el tiempo que dura esa frase
+    # (su timestamp es siempre el de la primera frase, índice 0)
+    hook_start, hook_end = timestamps[0]
+    card_path = OUTPUT_DIR / f"hook_card_{run_id}.png"
+    build_hook_card(phrases[0], card_path)
 
     safe_title = "".join(
         c if c.isalnum() or c in " _-" else "" for c in content["title"]
@@ -590,16 +747,26 @@ def assemble_video(content: dict, audio_path: str, timestamps: list, run_id: str
     target_kbps = int((MAX_UPLOAD_MB * 8 * 1024) / total_duration)
     video_kbps = max(600, target_kbps - audio_kbps)  # nunca bajar de una calidad mínima decente
 
+    # fondo escalado+recortado+subtítulos -> [bg]; encima se pega la
+    # tarjeta del gancho centrada, solo entre hook_start y hook_end -> [vout]
+    filter_complex = (
+        f"[0:v]scale=1080:1920:force_original_aspect_ratio=increase,"
+        f"crop=1080:1920,subtitles='{subs_filter_path}'[bg];"
+        f"[bg][2:v]overlay=x=(W-w)/2:y=(H-h)/2:"
+        f"enable='between(t,{hook_start:.2f},{hook_end:.2f})'[vout]"
+    )
+
     print(f"  Ensamblando vídeo vertical 1080x1920 ({video_kbps}kbps vídeo, objetivo <{MAX_UPLOAD_MB}MB)...", end=" ", flush=True)
     subprocess.run([
         "ffmpeg", "-y",
         "-ss", f"{bg_start:.2f}",       # Arranca en un punto aleatorio del fondo
         "-stream_loop", "-1",          # Repite el background hasta cubrir la duración
-        "-i", unix_path(BACKGROUND),
+        "-i", unix_path(background),
         "-i", unix_path(audio_path),
-        "-map", "0:v:0",                # Vídeo: del background
+        "-loop", "1", "-i", unix_path(card_path),   # tarjeta del gancho (imagen fija)
+        "-filter_complex", filter_complex,
+        "-map", "[vout]",
         "-map", "1:a:0",                # Audio: SOLO la narración TTS
-        "-vf", vf_chain,
         "-c:v", "libx264", "-preset", "fast",
         "-b:v", f"{video_kbps}k", "-maxrate", f"{int(video_kbps * 1.2)}k", "-bufsize", f"{video_kbps * 2}k",
         "-c:a", "aac", "-b:a", f"{audio_kbps}k",
@@ -609,6 +776,8 @@ def assemble_video(content: dict, audio_path: str, timestamps: list, run_id: str
         unix_path(output_path)
     ], check=True, capture_output=True)
     print("✓")
+
+    card_path.unlink(missing_ok=True)
 
     size_mb = os.path.getsize(output_path) / (1024 * 1024)
     print(f"✅ Short guardado: {output_path} ({size_mb:.1f} MB)")
@@ -670,10 +839,10 @@ def _upload_part(video_path: str, content: dict) -> str:
 
 # ── MAIN ──────────────────────────────────────────────────────────────────────
 def main():
-    if not BACKGROUND.exists():
+    if not BACKGROUNDS_DIR.exists() or not any(BACKGROUNDS_DIR.glob("*.mp4")):
         raise FileNotFoundError(
-            "❌ No se encontró background.mp4\n"
-            "   Descarga el vídeo de Minecraft y ponlo en esta carpeta con ese nombre."
+            f"❌ No hay ningún vídeo de fondo en '{BACKGROUNDS_DIR}/'.\n"
+            "   Pon al menos un .mp4 ahí dentro (la carpeta debe existir junto a este script)."
         )
 
     print("🚀 TikTok/Shorts — Reddit Story Pipeline")
@@ -701,11 +870,19 @@ def main():
         print(f"▶️  Parte {part_num}/{total_parts}")
 
         if part_num == 1:
-            content = plan  # ya trae 'phrases' de la Parte 1
+            story_content = plan  # ya trae 'phrases' de la Parte 1
         else:
-            content = generate_story_continuation(plan, part_num, all_phrases)
+            story_content = generate_story_continuation(plan, part_num, all_phrases)
 
-        all_phrases.extend(content["phrases"])
+        # 'all_phrases' se queda solo con el guion real (sin el gancho), para
+        # que el ancla de continuidad de la siguiente parte no se líe con la
+        # frase titular. El gancho se añade aparte, solo para el vídeo.
+        all_phrases.extend(story_content["phrases"])
+
+        hook_line = build_hook_line(plan, part_num)
+        content = dict(story_content)
+        content["phrases"] = [hook_line] + story_content["phrases"]
+        print(f"  🪝 Gancho de esta parte: {hook_line}")
 
         run_id = uuid.uuid4().hex[:8]
         audio_path, timestamps = generate_audio(content, run_id, voice)
