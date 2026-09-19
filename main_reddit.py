@@ -186,10 +186,75 @@ Devuelve SOLO JSON, sin markdown:
 PHRASES_PER_PART_MIN = 32
 PHRASES_PER_PART_MAX = 42
 
+# Reparto de probabilidad de cuántas partes tiene cada historia. Antes se lo
+# dejábamos decidir a Gemini, pero el prompt estaba sesgado hacia 2 y en la
+# práctica nunca salían vídeos de 1 sola parte ni de 3 — ahora lo decide el
+# código, con estos pesos (edítalos si quieres más o menos de un tipo).
+PART_COUNT_WEIGHTS = {1: 30, 2: 45, 3: 25}
 
-def generate_story_plan(topic: str) -> dict:
-    """Genera el plan completo de la historia y el contenido de la Parte 1."""
-    print(f"📝 Planificando historia sobre: {topic}")
+# El "gancho" es la frase titular que se dice al principio del vídeo. Tiene
+# que caber cómoda en la tarjeta y no alargar el vídeo — un gancho de 50+
+# palabras (que intenta resumir la historia ENTERA con final incluido) tarda
+# demasiado en narrarse y ocupa una tarjeta gigante en pantalla.
+MAX_HOOK_WORDS = 22
+
+
+def _enforce_hook_length(hook: str, max_words: int = MAX_HOOK_WORDS) -> str:
+    """Red de seguridad por si Gemini se pasa de largo con el gancho."""
+    words = hook.split()
+    if len(words) <= max_words:
+        return hook
+    trimmed = " ".join(words[:max_words]).rstrip(",.;:")
+    return trimmed + "…"
+
+
+def generate_story_plan(topic: str, total_parts: int) -> dict:
+    """Genera el plan de la historia y el contenido de la Parte 1.
+
+    `total_parts` ya viene decidido por el código (ver PART_COUNT_WEIGHTS en
+    main()) — Gemini ya no elige cuántas partes tiene la historia, solo
+    escribe el contenido sabiendo cuántas partes tiene que rellenar.
+    """
+    print(f"📝 Planificando historia sobre: {topic} ({total_parts} parte(s))")
+
+    if total_parts == 1:
+        estructura = (
+            "Esta historia se publica en UN SOLO vídeo, completa de principio a "
+            "fin: plantea la situación, desarróllala, llega al giro inesperado y "
+            "resuélvelo todo dentro de las mismas frases — no dejes nada para "
+            "después, no es una miniserie."
+        )
+        reglas_final = (
+            '- "phrases" es el guion COMPLETO de la historia (planteamiento, '
+            "desarrollo, giro y resolución) — no incluye el \"hook\", que se "
+            "añade aparte al principio\n"
+            f"- Entre {PHRASES_PER_PART_MIN} y {PHRASES_PER_PART_MAX} frases en total\n"
+            "- Termina con una resolución satisfactoria del giro y una pregunta "
+            "directa al espectador — PROHIBIDO terminar en cliffhanger o "
+            'invitar a ver "la siguiente parte" (no existe)'
+        )
+    else:
+        estructura = (
+            f"Esta historia se publica como una MINISERIE de {total_parts} "
+            "vídeos cortos, en la que cada parte (salvo la última) termina en "
+            "un momento de máxima tensión para que el espectador quiera ver la "
+            "siguiente en el perfil."
+        )
+        reglas_final = (
+            '- "phrases" es SOLO el guion de la Parte 1 (no de la historia '
+            'entera, y no incluye el "hook" — ese se añade aparte al principio '
+            "del vídeo)\n"
+            f"- Entre {PHRASES_PER_PART_MIN} y {PHRASES_PER_PART_MAX} frases en la Parte 1\n"
+            "- Desarrolla la Parte 1 con contexto, escenas y algo de diálogo, "
+            "pero SIN llegar todavía al giro ni a la resolución — eso va en "
+            "la(s) parte(s) siguiente(s)\n"
+            "- Termina la Parte 1 justo en un punto de máxima tensión o "
+            "intriga (un cliffhanger real, no resuelvas nada)\n"
+            "- Las últimas 2 frases deben invitar de forma natural a ver la "
+            'parte siguiente, por ejemplo algo como "¿Qué hice después?" '
+            'seguido de "Parte 2 en mi perfil" — adáptalo al tono de la '
+            "historia"
+        )
 
     prompt = f"""
 Eres un creador de contenido viral para TikTok y YouTube Shorts en español.
@@ -202,10 +267,7 @@ La historia debe ser muy adictiva, con un giro inesperado hacia el final.
 Desarrolla libremente los detalles, nombres y personajes — la premisa es solo
 el punto de partida.
 
-Esta historia se va a publicar como una MINISERIE de 2 o 3 vídeos cortos (tú
-decides cuántos, según cuánto dé de sí la trama), en la que cada parte termina
-en un momento de máxima tensión para que el espectador quiera ver la
-siguiente en el perfil.
+{estructura}
 
 Devuelve SOLO JSON válido, sin markdown ni explicaciones:
 
@@ -214,8 +276,7 @@ Devuelve SOLO JSON válido, sin markdown ni explicaciones:
   "description": "Descripción para YouTube con emojis (max 150 caracteres)",
   "tags": ["shorts", "historia", "drama", "reddit", "viral"],
   "narrator_gender": "male o female — el género de quien narra en primera persona",
-  "total_parts": 2,
-  "hook": "Frase titular tipo clickbait que resume la historia entera de un tirón, con premisa + un adelanto del desenlace o la victoria (ej: 'Mi suegra intentó arruinar mi boda y le hice pagar hasta el último centavo'). Se dice literalmente como la primera frase del vídeo, antes de empezar a narrar — sin límite de palabras, como un titular real.",
+  "hook": "Frase titular corta tipo clickbait que da curiosidad por saber CÓMO pasó (ej: 'Mi suegra intentó arruinar mi boda y me aseguré de que lo pagara caro'). Se dice literalmente como la primera frase del vídeo, antes de empezar a narrar.",
   "outline": "Resumen en 4-6 frases de TODA la historia de principio a fin, incluido el giro final. Esto es solo para que tú mismo lo uses de guía al escribir las siguientes partes — el espectador NUNCA ve este resumen.",
   "phrases": [
     "Frase corta de máximo 6 palabras.",
@@ -225,26 +286,14 @@ Devuelve SOLO JSON válido, sin markdown ni explicaciones:
 }}
 
 Reglas:
-- "total_parts": pon 2 o 3 (el número entero, sin comillas), según lo que dé
-  de sí la historia. La mayoría de historias funcionan bien en 2 partes;
-  usa 3 solo si de verdad hay suficiente trama para justificarlo.
-- "hook" es UNA sola frase completa, tipo titular de noticia, que da
-  curiosidad por saber CÓMO pasó, sin explicar los detalles — no hace falta
-  que sea corta ni seguir la regla de 6 palabras, es la excepción
-- "phrases" es SOLO el guion de la Parte 1 (no de la historia entera, y no
-  incluye el "hook" — ese se añade aparte al principio del vídeo)
-- Entre {PHRASES_PER_PART_MIN} y {PHRASES_PER_PART_MAX} frases en la Parte 1
-- Cada frase: máximo 6 palabras, impactante y clara
+- "hook" es UNA sola frase, tipo titular de noticia — MÁXIMO {MAX_HOOK_WORDS}
+  PALABRAS, sin excepción. Es un anzuelo que da curiosidad por CÓMO pasó,
+  NO un resumen de la historia entera ni del final — nunca reveles el giro,
+  el desenlace ni cómo se resuelve, solo la premisa llamativa
+- Cada frase de "phrases": máximo 6 palabras, impactante y clara
 - Como el "hook" ya engancha al principio, la primera frase de "phrases"
   puede simplemente empezar a plantar la escena con normalidad
-- Desarrolla la Parte 1 con contexto, escenas y algo de diálogo, pero SIN
-  llegar todavía al giro ni a la resolución — eso va en la(s) parte(s)
-  siguiente(s)
-- Termina la Parte 1 justo en un punto de máxima tensión o intriga (un
-  cliffhanger real, no resuelvas nada)
-- Las últimas 2 frases deben invitar de forma natural a ver la parte
-  siguiente, por ejemplo algo como "¿Qué hice después?" seguido de
-  "Parte 2 en mi perfil" — adáptalo al tono de la historia
+{reglas_final}
 - "narrator_gender" debe ser exactamente "male" o "female"
 - Devolver SOLO el JSON
 """
@@ -257,14 +306,6 @@ Reglas:
         gender = "female"
     plan["narrator_gender"] = gender
     plan["topic"] = topic
-
-    total_parts = plan.get("total_parts", 2)
-    try:
-        total_parts = int(total_parts)
-    except (TypeError, ValueError):
-        total_parts = 2
-    if total_parts not in (2, 3):
-        total_parts = 2
     plan["total_parts"] = total_parts
 
     # Por si Gemini se olvida del campo (raro, pero el modelo de respaldo a
@@ -272,10 +313,11 @@ Reglas:
     hook = plan.get("hook", "").strip()
     if not hook:
         hook = plan["title"]
+    hook = _enforce_hook_length(hook)
     plan["hook"] = hook
 
     print(f"✅ Historia: {plan['title']}")
-    print(f"   Gancho: {plan['hook']}")
+    print(f"   Gancho ({len(hook.split())} palabras): {plan['hook']}")
     print(f"   Planificada en {total_parts} parte(s) — narrador: {gender}")
     print(f"   Parte 1: {len(plan['phrases'])} frases")
     return plan
@@ -735,7 +777,7 @@ def assemble_video(content: dict, audio_path: str, timestamps: list, run_id: str
     safe_title = "".join(
         c if c.isalnum() or c in " _-" else "" for c in content["title"]
     ).strip()
-    part_suffix = f" Parte {part_num}-{total_parts}" if part_num and total_parts else ""
+    part_suffix = f" Parte {part_num}-{total_parts}" if total_parts and total_parts > 1 else ""
     output_path = SHORTS_DIR / f"{safe_title}{part_suffix} [{run_id}].mp4"
 
     # TikTok solo admite subir el borrador como UN único trozo de máx. 64MB
@@ -788,7 +830,7 @@ def assemble_video(content: dict, audio_path: str, timestamps: list, run_id: str
 def save_metadata(content: dict, video_path: str, run_id: str,
                    part_num: int = None, total_parts: int = None) -> dict:
     title = content["title"]
-    if part_num and total_parts:
+    if total_parts and total_parts > 1:
         title = f"{title} (Parte {part_num}/{total_parts})"
     metadata = {
         "title":       title,
@@ -853,9 +895,18 @@ def main():
 
     topics = generate_topics()
     topic  = random.choice(topics)
-    plan   = generate_story_plan(topic)
 
-    total_parts = plan["total_parts"]
+    # El número de partes lo decide el código (no Gemini), al azar y
+    # ponderado según PART_COUNT_WEIGHTS — así salen mezcladas historias de
+    # 1, 2 y 3 partes en vez de caer siempre en el mismo número.
+    total_parts = random.choices(
+        list(PART_COUNT_WEIGHTS.keys()),
+        weights=list(PART_COUNT_WEIGHTS.values()),
+        k=1,
+    )[0]
+
+    plan = generate_story_plan(topic, total_parts)
+
     # Misma voz para TODAS las partes de la historia, para que el narrador
     # no cambie de un vídeo al siguiente.
     voice = random.choice(VOICES[plan["narrator_gender"]])
