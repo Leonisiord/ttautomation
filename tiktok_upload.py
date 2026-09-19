@@ -162,7 +162,41 @@ def _get_creator_info(access_token: str):
     )
 
 
-def _init_direct_post(access_token: str, video_size: int, chunk_size: int, total_chunk_count: int, title: str, privacy_level: str):
+def get_creator_info() -> dict:
+    """
+    Wrapper público: devuelve la info del creador ya "parseada" (nickname,
+    avatar, opciones de privacidad disponibles, qué interacciones puede
+    desactivar, duración máxima admitida...). La usa review_publish.py para
+    pintar el formulario de revisión con datos reales de la API, en vez de
+    valores fijos — la auditoría de TikTok exige justo eso.
+    """
+    tokens = _load_tokens()
+    access_token = tokens["access_token"]
+
+    response = _get_creator_info(access_token)
+    if response.status_code == 401:
+        tokens = _refresh_access_token(tokens)
+        access_token = tokens["access_token"]
+        response = _get_creator_info(access_token)
+    response.raise_for_status()
+    data = response.json().get("data", {})
+
+    return {
+        "creator_nickname":            data.get("creator_nickname", ""),
+        "creator_username":            data.get("creator_username", ""),
+        "creator_avatar_url":          data.get("creator_avatar_url", ""),
+        "privacy_level_options":       data.get("privacy_level_options", []),
+        "comment_disabled":            data.get("comment_disabled", False),
+        "duet_disabled":               data.get("duet_disabled", False),
+        "stitch_disabled":             data.get("stitch_disabled", False),
+        "max_video_post_duration_sec": data.get("max_video_post_duration_sec"),
+    }
+
+
+def _init_direct_post(access_token: str, video_size: int, chunk_size: int, total_chunk_count: int,
+                       title: str, privacy_level: str, disable_comment: bool, disable_duet: bool,
+                       disable_stitch: bool, brand_content_toggle: bool, brand_organic_toggle: bool,
+                       is_aigc: bool):
     return requests.post(
         "https://open.tiktokapis.com/v2/post/publish/video/init/",
         headers={
@@ -173,9 +207,15 @@ def _init_direct_post(access_token: str, video_size: int, chunk_size: int, total
             "post_info": {
                 "title": title,
                 "privacy_level": privacy_level,
-                "disable_duet": False,
-                "disable_comment": False,
-                "disable_stitch": False,
+                "disable_duet": disable_duet,
+                "disable_comment": disable_comment,
+                "disable_stitch": disable_stitch,
+                "brand_content_toggle": brand_content_toggle,
+                "brand_organic_toggle": brand_organic_toggle,
+                # Contenido narrado y generado con IA de principio a fin —
+                # TikTok exige declarar esto en las Normas de la Comunidad,
+                # así que va SIEMPRE en True, no es opcional.
+                "is_aigc": is_aigc,
             },
             "source_info": {
                 "source": "FILE_UPLOAD",
@@ -187,44 +227,55 @@ def _init_direct_post(access_token: str, video_size: int, chunk_size: int, total
     )
 
 
-def upload_video_direct_post(video_path: str, title: str, privacy_level: str = "SELF_ONLY") -> str:
+def upload_video_direct_post(
+    video_path: str,
+    title: str,
+    privacy_level: str,
+    disable_comment: bool = False,
+    disable_duet: bool = False,
+    disable_stitch: bool = False,
+    brand_content_toggle: bool = False,
+    brand_organic_toggle: bool = False,
+    is_aigc: bool = True,
+) -> str:
     """
-    Publica el vídeo directamente en el perfil de la cuenta autorizada, con
-    el título/hashtags ya puestos (el parámetro 'title' puede incluir
-    #hashtags, TikTok los detecta solo). Mientras la app no esté auditada,
-    TikTok fuerza que la publicación quede como privada (SELF_ONLY) — hay
-    que entrar a la app y cambiarla a pública a mano.
+    Publica el vídeo directamente en el perfil de la cuenta autorizada.
+
+    ⚠️ IMPORTANTE: esta función SOLO debe llamarse tras una acción explícita
+    de una persona (el botón "Publicar" de review_publish.py) — nunca de
+    forma automática dentro del pipeline. Es justo lo que exige la
+    auditoría de TikTok: preview real + consentimiento antes de cada
+    publicación, no publicación desatendida.
+
+    Todos los valores (privacy_level, los disable_*, los brand_*_toggle)
+    deben venir del formulario que rellenó la persona, con las opciones que
+    de verdad ofrece get_creator_info() — nunca puestos a mano aquí.
     Devuelve el publish_id que da TikTok.
     """
-    print(f"\n📤 Publicando en TikTok (privado, con título/hashtags): {video_path}")
+    print(f"\n📤 Publicando en TikTok: {video_path}")
 
     tokens = _load_tokens()
     access_token = tokens["access_token"]
-
-    info_response = _get_creator_info(access_token)
-    if info_response.status_code == 401:
-        tokens = _refresh_access_token(tokens)
-        access_token = tokens["access_token"]
-        info_response = _get_creator_info(access_token)
-    info_response.raise_for_status()
-    info_data = info_response.json()
-
-    available = info_data.get("data", {}).get("privacy_level_options", [])
-    if available and privacy_level not in available:
-        print(f"  ⚠️ '{privacy_level}' no disponible para esta cuenta, usando '{available[0]}' en su lugar.")
-        privacy_level = available[0]
 
     video_size = os.path.getsize(video_path)
     chunk_size, total_chunk_count = _compute_chunk_plan(video_size)
     print(f"  📦 {video_size / (1024*1024):.1f}MB en {total_chunk_count} trozo(s)")
 
-    init_response = _init_direct_post(access_token, video_size, chunk_size, total_chunk_count, title, privacy_level)
+    init_response = _init_direct_post(
+        access_token, video_size, chunk_size, total_chunk_count, title, privacy_level,
+        disable_comment, disable_duet, disable_stitch, brand_content_toggle,
+        brand_organic_toggle, is_aigc,
+    )
 
     if init_response.status_code == 401:
         print("  🔄 Token caducado, renovando...")
         tokens = _refresh_access_token(tokens)
         access_token = tokens["access_token"]
-        init_response = _init_direct_post(access_token, video_size, chunk_size, total_chunk_count, title, privacy_level)
+        init_response = _init_direct_post(
+            access_token, video_size, chunk_size, total_chunk_count, title, privacy_level,
+            disable_comment, disable_duet, disable_stitch, brand_content_toggle,
+            brand_organic_toggle, is_aigc,
+        )
 
     if not init_response.ok:
         print(f"  ❌ TikTok respondió {init_response.status_code}: {init_response.text}")
@@ -239,8 +290,7 @@ def upload_video_direct_post(video_path: str, title: str, privacy_level: str = "
 
     _put_video_chunks(upload_url, video_path, video_size, chunk_size, total_chunk_count)
 
-    print(f"✅ Publicado en modo {privacy_level} (publish_id: {publish_id})")
-    print("   📱 Abre TikTok en el móvil para cambiarlo a público.")
+    print(f"✅ Enviado a publicar en modo {privacy_level} (publish_id: {publish_id})")
     return publish_id
 
 

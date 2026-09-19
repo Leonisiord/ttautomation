@@ -22,19 +22,36 @@ import edge_tts
 from dotenv import load_dotenv
 from google import genai
 from PIL import Image, ImageDraw, ImageFont
-from tiktok_upload import upload_video_as_draft, upload_video_direct_post
+from tiktok_upload import upload_video_as_draft
+from youtube_upload import upload_video as upload_video_youtube
 
 # Pon esto en False si alguna vez quieres generar el vídeo sin subirlo
 AUTO_UPLOAD_TIKTOK = True
 
-# "direct_post" → publica ya con título/hashtags puestos, pero en privado.
-#                 ⚠️ TikTok NO permite este modo mientras la app esté en
-#                 Sandbox (da 403) — solo funcionará una vez pase la
-#                 auditoría completa y la app esté en modo Live/Producción.
-# "draft"       → sube a la bandeja de borradores sin título/hashtags (hay
-#                 que ponerlos a mano al abrir el borrador en el móvil).
-#                 Es el único modo que Sandbox permite — el que ya usábamos.
+# "draft"  → sube a la bandeja de borradores de TikTok sin título/hashtags
+#            (hay que ponerlos a mano al abrir el borrador en el móvil, y
+#            tocar "Publicar" tú mismo ahí). Funciona siempre, auditado o
+#            no — es el modo que hemos usado desde el principio.
+# "review" → NO sube nada a TikTok automáticamente. En vez de eso, empaqueta
+#            el vídeo + los metadatos (título/hashtags ya redactados) como
+#            asset de una GitHub Release ("pending-review"), para que los
+#            recojas con review_publish.py en tu ordenador, los repases
+#            (vista previa, privacidad, comentarios/dúo/stitch...) y los
+#            publiques tú con un clic — eso ya satisface el requisito de
+#            "consentimiento explícito antes de publicar" de la auditoría
+#            de TikTok, y de paso sube por el endpoint de Direct Post, que
+#            si trocea bien los vídeos grandes (a diferencia del endpoint
+#            de borradores) — mejor calidad en vídeos largos.
+#            ⚠️ Solo tiene sentido una vez tu app haya pasado la auditoría
+#            de TikTok (si no, "publicar" seguiría forzando SELF_ONLY).
 TIKTOK_UPLOAD_MODE = "draft"
+
+# Sube también a YouTube Shorts como público, pero SOLO la Parte 1 de cada
+# historia (o las historias de 1 sola parte) — nunca las partes 2/3. La
+# cuota gratuita de la API de YouTube es de 10.000 unidades/día y cada
+# subida cuesta 1.600, así que limitar a 1 vídeo por historia es lo que
+# mantiene esto dentro de la cuota sin tener que tocar nada más.
+AUTO_UPLOAD_YOUTUBE = True
 
 # ── Configuración ──────────────────────────────────────────────────────────────
 load_dotenv()
@@ -858,23 +875,61 @@ def build_tiktok_caption(content: dict) -> str:
     return caption[:2200]  # límite de TikTok (caracteres UTF-16)
 
 
-def _upload_part(video_path: str, content: dict) -> str:
-    """Sube una parte a TikTok y devuelve el publish_id (o None si falla)."""
+def _queue_for_review(video_path: str, content: dict, run_id: str, metadata: dict):
+    """
+    Modo 'review': en vez de subir el vídeo a TikTok, lo empaqueta como
+    asset de la GitHub Release 'pending-review' junto con sus metadatos
+    (incluido el caption ya redactado), para que review_publish.py los
+    recoja en tu ordenador y decidas tú cuándo y cómo publicarlos.
+    Requiere el CLI 'gh' autenticado (variable de entorno GH_TOKEN) con
+    permiso de escritura sobre el repo (contents: write).
+    """
     try:
-        if TIKTOK_UPLOAD_MODE == "direct_post":
-            caption = build_tiktok_caption(content)
-            publish_id = upload_video_direct_post(video_path, caption)
-        else:
-            publish_id = upload_video_as_draft(video_path)
+        subprocess.run(["gh", "release", "view", "pending-review"], check=True, capture_output=True)
+    except subprocess.CalledProcessError:
+        subprocess.run(
+            ["gh", "release", "create", "pending-review",
+             "--title", "Vídeos pendientes de revisar",
+             "--notes", "Generados automáticamente — revísalos con review_publish.py antes de publicarlos.",
+             "--prerelease"],
+            check=True, capture_output=True,
+        )
 
+    review_path = SHORTS_DIR / f"review_{run_id}.json"
+    review_payload = dict(metadata)
+    review_payload["caption"] = build_tiktok_caption(content)
+    review_payload["run_id"] = run_id
+    with open(review_path, "w", encoding="utf-8") as f:
+        json.dump(review_payload, f, indent=2, ensure_ascii=False)
+
+    subprocess.run(
+        ["gh", "release", "upload", "pending-review", video_path, str(review_path), "--clobber"],
+        check=True, capture_output=True,
+    )
+    print(f"📦 En cola de revisión (Release 'pending-review'): {os.path.basename(video_path)}")
+
+
+def _upload_part(video_path: str, content: dict, run_id: str, metadata: dict) -> str:
+    """
+    Gestiona la parte de TikTok según TIKTOK_UPLOAD_MODE:
+    - "draft":  sube a la bandeja de borradores, devuelve "draft:<publish_id>".
+    - "review": la encola para revisar/publicar a mano, devuelve "review".
+    Devuelve None si algo falla (el vídeo se queda solo en tu carpeta).
+    """
+    try:
+        if TIKTOK_UPLOAD_MODE == "review":
+            _queue_for_review(video_path, content, run_id, metadata)
+            return "review"
+
+        publish_id = upload_video_as_draft(video_path)
         # Se añade una línea por parte subida, para que el workflow de
         # GitHub Actions pueda comprobar el estado real de CADA vídeo
         # (con tiktok_check_status.py) sin depender del móvil.
         with open("last_publish_id.txt", "a", encoding="utf-8") as f:
             f.write(publish_id + "\n")
-        return publish_id
+        return f"draft:{publish_id}"
     except Exception as e:
-        print(f"⚠️ No se pudo subir a TikTok automáticamente: {e}")
+        print(f"⚠️ No se pudo subir/encolar en TikTok automáticamente: {e}")
         print("   El vídeo sigue en tu carpeta, puedes subirlo a mano.")
         return None
 
@@ -940,18 +995,34 @@ def main():
         video_path = assemble_video(content, audio_path, timestamps, run_id, part_num, total_parts)
         metadata = save_metadata(content, video_path, run_id, part_num, total_parts)
 
-        publish_id = None
+        tiktok_status = None
         if AUTO_UPLOAD_TIKTOK:
-            publish_id = _upload_part(video_path, content)
+            tiktok_status = _upload_part(video_path, content, run_id, metadata)
 
-        results.append((metadata["title"], video_path, publish_id))
+        youtube_id = None
+        if AUTO_UPLOAD_YOUTUBE and part_num == 1:
+            youtube_id = upload_video_youtube(video_path, content)
+
+        results.append((metadata["title"], video_path, tiktok_status, youtube_id, part_num))
 
     print("\n" + "=" * 50)
     print(f"🎉 ¡Miniserie completada! ({total_parts} parte(s))")
-    for title, video_path, publish_id in results:
-        estado = "subido" if publish_id else "NO subido (revisar arriba)"
-        print(f"📱 {title} — {video_path} — {estado}")
-    print("\n➡️  Revisa los borradores en TikTok y publícalos desde el móvil, en orden")
+    for title, video_path, tiktok_status, youtube_id, part_num in results:
+        if tiktok_status == "review":
+            estado_tiktok = "en cola de revisión (usa review_publish.py)"
+        elif tiktok_status and tiktok_status.startswith("draft:"):
+            estado_tiktok = f"borrador subido ({tiktok_status.split(':', 1)[1]})"
+        else:
+            estado_tiktok = "NO subido (revisar arriba)"
+
+        if part_num != 1:
+            estado_yt = "no aplica (no es la Parte 1)"
+        elif youtube_id:
+            estado_yt = f"https://youtube.com/shorts/{youtube_id}"
+        else:
+            estado_yt = "NO subido (revisar arriba)"
+        print(f"📱 {title} — {video_path} — TikTok: {estado_tiktok} — YouTube: {estado_yt}")
+    print("\n➡️  Revisa los borradores/la cola de revisión y publica en orden")
 
 
 if __name__ == "__main__":
