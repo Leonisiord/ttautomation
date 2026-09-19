@@ -12,6 +12,13 @@ concurrency:
   group: generar-video
   cancel-in-progress: false
  
+# "contents: write" hace falta para que, si algún día pones
+# TIKTOK_UPLOAD_MODE = "review" en main_reddit.py, el pipeline pueda crear
+# y subir assets a la GitHub Release "pending-review" con el CLI `gh`. En
+# modo "draft" (el que usamos ahora) no se necesita, pero no molesta dejarlo.
+permissions:
+  contents: write
+ 
 jobs:
   generar:
     runs-on: ubuntu-latest
@@ -32,7 +39,7 @@ jobs:
         run: sudo apt-get update -qq && sudo apt-get install -y ffmpeg
  
       - name: Instalar dependencias de Python
-        run: pip install edge-tts python-dotenv google-genai requests pillow
+        run: pip install edge-tts python-dotenv google-genai requests pillow google-auth google-auth-oauthlib google-api-python-client
  
       - name: Instalar fuentes (para la tarjeta del gancho)
         run: sudo apt-get install -y fonts-liberation fontconfig
@@ -89,7 +96,16 @@ jobs:
           TIKTOK_REDIRECT_URI=${{ secrets.TIKTOK_REDIRECT_URI }}
           EOF
  
+      # A diferencia de TikTok, el refresh_token de Google no cambia entre
+      # ejecuciones (Google no lo rota), así que no hace falta cachearlo ni
+      # guardarlo de vuelta — basta con recrear el archivo desde el secret
+      # en cada ejecución.
+      - name: Crear youtube_tokens.json desde el secret
+        run: echo '${{ secrets.YOUTUBE_TOKENS_JSON }}' > youtube_tokens.json
+ 
       - name: Ejecutar el pipeline (genera y sube el short)
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: python main_reddit.py
  
       - name: Comprobar el estado real en TikTok
